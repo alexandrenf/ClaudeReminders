@@ -1,0 +1,13 @@
+{
+  "name": "claude-reminders-worker",
+  "version": "1.0.0",
+  "description": "Polls Google Calendar and sends Pushover notifications",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "googleapis": "^144.0.0",
+    "node-fetch": "^2.7.0"
+  }
+}
