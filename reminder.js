@@ -125,11 +125,6 @@ function send(res, status, body) {
   res.end(payload);
 }
 
-function sendHtml(res, status, html) {
-  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(html) });
-  res.end(html);
-}
-
 // ── Health checks ─────────────────────────────────────────────────────────────
 async function runHealthChecks() {
   const uptimeSeconds = Math.floor((Date.now() - startedAt) / 1000);
@@ -140,8 +135,15 @@ async function runHealthChecks() {
   let calendarDetail = "";
   try {
     const calendar = getCalendarClient();
+    const now = new Date();
     await Promise.race([
-      calendar.calendarList.get({ calendarId: CALENDAR_ID }),
+      calendar.events.list({
+        calendarId: CALENDAR_ID,
+        timeMin: now.toISOString(),
+        timeMax: now.toISOString(),
+        maxResults: 1,
+        singleEvents: true,
+      }),
       new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout after 5s")), 5000)),
     ]);
     calendarDetail = `Connected (${CALENDAR_ID.slice(0, 6)}…)`;
@@ -160,81 +162,40 @@ async function runHealthChecks() {
   };
 }
 
-function buildStatusHtml(checks) {
-  const overall = checks.healthy;
-  const rows = [
-    ["Server uptime", "ok", `${checks.uptime}s`],
-    ["Memory (heap used)", "ok", `${checks.memoryMb} MB`],
-    ["Node.js version", "ok", checks.nodeVersion],
-    ["Google Calendar", checks.calendar.status, checks.calendar.detail],
-  ];
 
-  const rowsHtml = rows.map(([label, status, detail]) => {
-    const icon = status === "ok" ? "✓" : "✗";
-    const color = status === "ok" ? "#22c55e" : "#ef4444";
-    return `<tr>
-      <td>${label}</td>
-      <td style="color:${color};font-weight:bold">${icon} ${status}</td>
-      <td style="color:#94a3b8">${detail}</td>
-    </tr>`;
-  }).join("\n");
-
-  const headerColor = overall ? "#22c55e" : "#ef4444";
-  const headerText = overall ? "✓ All systems operational" : "✗ Degraded";
-
-  return `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>System Health</title>
-  <style>
-    body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 2rem; }
-    h1 { color: ${headerColor}; margin-bottom: 0.25rem; }
-    p.ts { color: #64748b; font-size: 0.85rem; margin-top: 0; }
-    table { border-collapse: collapse; width: 100%; max-width: 600px; }
-    th, td { padding: 0.6rem 1rem; text-align: left; border-bottom: 1px solid #1e293b; }
-    th { color: #64748b; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; }
-  </style>
-</head>
-<body>
-  <h1>${headerText}</h1>
-  <p class="ts">Checked at ${checks.checkedAt}</p>
-  <table>
-    <thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead>
-    <tbody>${rowsHtml}</tbody>
-  </table>
-</body>
-</html>`;
+function isAuthorized(req, query) {
+  const bearer = req.headers.authorization ?? "";
+  const queryToken = query.get("token") ?? "";
+  return bearer === `Bearer ${NOTIFY_TOKEN}` || queryToken === NOTIFY_TOKEN;
 }
 
 const httpServer = http.createServer(async (req, res) => {
+  const { pathname, searchParams } = new URL(req.url, "http://localhost");
+
   // GET /health — no auth required (used by Fly.io)
-  if (req.method === "GET" && req.url === "/health") {
+  if (req.method === "GET" && pathname === "/health") {
     send(res, 200, { status: "ok", uptime: Math.floor((Date.now() - startedAt) / 1000) });
     return;
   }
 
-  // GET /status — HTML health page, requires Bearer NOTIFY_TOKEN (for UptimeRobot)
-  if (req.method === "GET" && req.url === "/status") {
-    const auth = req.headers.authorization ?? "";
-    if (auth !== `Bearer ${NOTIFY_TOKEN}`) {
-      sendHtml(res, 401, "<html><body><h1>401 Unauthorized</h1></body></html>");
+  // GET /status — JSON health, requires token (for UptimeRobot)
+  if (req.method === "GET" && pathname === "/status") {
+    if (!isAuthorized(req, searchParams)) {
+      send(res, 401, { error: "Unauthorized" });
       return;
     }
     try {
       const checks = await runHealthChecks();
-      sendHtml(res, checks.healthy ? 200 : 503, buildStatusHtml(checks));
+      send(res, checks.healthy ? 200 : 503, checks);
     } catch (err) {
-      sendHtml(res, 500, `<html><body><h1>500 Internal Error</h1><pre>${err.message}</pre></body></html>`);
+      send(res, 500, { error: err.message });
     }
     return;
   }
 
-  // POST /notify — requires Bearer NOTIFY_TOKEN
-  if (req.method === "POST" && req.url === "/notify") {
-    const auth = req.headers.authorization ?? "";
-    if (auth !== `Bearer ${NOTIFY_TOKEN}`) {
+  // POST /notify — requires token
+  if (req.method === "POST" && pathname === "/notify") {
+    if (!isAuthorized(req, searchParams)) {
       send(res, 401, { error: "Unauthorized" });
       return;
     }
