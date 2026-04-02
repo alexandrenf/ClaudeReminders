@@ -127,12 +127,13 @@ function send(res, status, body) {
 
 // ── Health checks ─────────────────────────────────────────────────────────────
 async function runHealthChecks() {
-  const uptimeSeconds = Math.floor((Date.now() - startedAt) / 1000);
-  const mem = process.memoryUsage();
+  const report = {
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    uptime: Math.floor((Date.now() - startedAt) / 1000),
+    calendar: null,
+  };
 
-  // Google Calendar connectivity check
-  let calendarStatus = "ok";
-  let calendarDetail = "";
   try {
     const calendar = getCalendarClient();
     const now = new Date();
@@ -146,20 +147,13 @@ async function runHealthChecks() {
       }),
       new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout after 5s")), 5000)),
     ]);
-    calendarDetail = `Connected (${CALENDAR_ID.slice(0, 6)}…)`;
+    report.calendar = { status: "ok" };
   } catch (err) {
-    calendarStatus = "error";
-    calendarDetail = err.message;
+    report.calendar = { status: "error", error: err.message };
+    report.status = "degraded";
   }
 
-  return {
-    healthy: calendarStatus === "ok",
-    uptime: uptimeSeconds,
-    memoryMb: (mem.heapUsed / 1024 / 1024).toFixed(1),
-    nodeVersion: process.version,
-    calendar: { status: calendarStatus, detail: calendarDetail },
-    checkedAt: new Date().toISOString(),
-  };
+  return report;
 }
 
 
@@ -186,9 +180,9 @@ const httpServer = http.createServer(async (req, res) => {
     }
     try {
       const checks = await runHealthChecks();
-      send(res, checks.healthy ? 200 : 503, checks);
+      send(res, checks.status === "ok" ? 200 : 503, checks);
     } catch (err) {
-      send(res, 500, { error: err.message });
+      send(res, 500, { status: "error", error: err.message });
     }
     return;
   }
