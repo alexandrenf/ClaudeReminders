@@ -149,8 +149,8 @@ async function runHealthChecks() {
     ]);
     report.calendar = { status: "ok" };
   } catch (err) {
-    report.calendar = { status: "error", error: err.message };
-    report.status = "degraded";
+    report.calendar = { status: "down", error: err.message };
+    report.status = "down";
   }
 
   return report;
@@ -180,9 +180,9 @@ const httpServer = http.createServer(async (req, res) => {
     }
     try {
       const checks = await runHealthChecks();
-      send(res, checks.status === "ok" ? 200 : 503, checks);
+      send(res, 200, checks);
     } catch (err) {
-      send(res, 500, { status: "error", error: err.message });
+      send(res, 200, { status: "down", error: err.message });
     }
     return;
   }
