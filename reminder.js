@@ -2,7 +2,8 @@
  * reminder.js — drop-in replacement for worker.js
  *
  * Adds a lightweight HTTP server alongside the existing calendar polling logic:
- *   GET  /health  → 200 { status: "ok", uptime: <seconds> }   (no auth)
+ *   GET  /health  → 200 { status: "ok", uptime: <seconds> }   (no auth, used by Fly.io)
+ *   GET  /status  → HTML health page with calendar check       (requires Bearer NOTIFY_TOKEN, for UptimeRobot)
  *   POST /notify  → sends a Pushover notification directly     (requires Bearer NOTIFY_TOKEN)
  *
  * Fly.io setup:
@@ -124,10 +125,109 @@ function send(res, status, body) {
   res.end(payload);
 }
 
+function sendHtml(res, status, html) {
+  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8", "Content-Length": Buffer.byteLength(html) });
+  res.end(html);
+}
+
+// ── Health checks ─────────────────────────────────────────────────────────────
+async function runHealthChecks() {
+  const uptimeSeconds = Math.floor((Date.now() - startedAt) / 1000);
+  const mem = process.memoryUsage();
+
+  // Google Calendar connectivity check
+  let calendarStatus = "ok";
+  let calendarDetail = "";
+  try {
+    const calendar = getCalendarClient();
+    await Promise.race([
+      calendar.calendarList.get({ calendarId: CALENDAR_ID }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout after 5s")), 5000)),
+    ]);
+    calendarDetail = `Connected (${CALENDAR_ID.slice(0, 6)}…)`;
+  } catch (err) {
+    calendarStatus = "error";
+    calendarDetail = err.message;
+  }
+
+  return {
+    healthy: calendarStatus === "ok",
+    uptime: uptimeSeconds,
+    memoryMb: (mem.heapUsed / 1024 / 1024).toFixed(1),
+    nodeVersion: process.version,
+    calendar: { status: calendarStatus, detail: calendarDetail },
+    checkedAt: new Date().toISOString(),
+  };
+}
+
+function buildStatusHtml(checks) {
+  const overall = checks.healthy;
+  const rows = [
+    ["Server uptime", "ok", `${checks.uptime}s`],
+    ["Memory (heap used)", "ok", `${checks.memoryMb} MB`],
+    ["Node.js version", "ok", checks.nodeVersion],
+    ["Google Calendar", checks.calendar.status, checks.calendar.detail],
+  ];
+
+  const rowsHtml = rows.map(([label, status, detail]) => {
+    const icon = status === "ok" ? "✓" : "✗";
+    const color = status === "ok" ? "#22c55e" : "#ef4444";
+    return `<tr>
+      <td>${label}</td>
+      <td style="color:${color};font-weight:bold">${icon} ${status}</td>
+      <td style="color:#94a3b8">${detail}</td>
+    </tr>`;
+  }).join("\n");
+
+  const headerColor = overall ? "#22c55e" : "#ef4444";
+  const headerText = overall ? "✓ All systems operational" : "✗ Degraded";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>System Health</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 2rem; }
+    h1 { color: ${headerColor}; margin-bottom: 0.25rem; }
+    p.ts { color: #64748b; font-size: 0.85rem; margin-top: 0; }
+    table { border-collapse: collapse; width: 100%; max-width: 600px; }
+    th, td { padding: 0.6rem 1rem; text-align: left; border-bottom: 1px solid #1e293b; }
+    th { color: #64748b; font-weight: 600; font-size: 0.8rem; text-transform: uppercase; }
+  </style>
+</head>
+<body>
+  <h1>${headerText}</h1>
+  <p class="ts">Checked at ${checks.checkedAt}</p>
+  <table>
+    <thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead>
+    <tbody>${rowsHtml}</tbody>
+  </table>
+</body>
+</html>`;
+}
+
 const httpServer = http.createServer(async (req, res) => {
-  // GET /health — no auth required
+  // GET /health — no auth required (used by Fly.io)
   if (req.method === "GET" && req.url === "/health") {
     send(res, 200, { status: "ok", uptime: Math.floor((Date.now() - startedAt) / 1000) });
+    return;
+  }
+
+  // GET /status — HTML health page, requires Bearer NOTIFY_TOKEN (for UptimeRobot)
+  if (req.method === "GET" && req.url === "/status") {
+    const auth = req.headers.authorization ?? "";
+    if (auth !== `Bearer ${NOTIFY_TOKEN}`) {
+      sendHtml(res, 401, "<html><body><h1>401 Unauthorized</h1></body></html>");
+      return;
+    }
+    try {
+      const checks = await runHealthChecks();
+      sendHtml(res, checks.healthy ? 200 : 503, buildStatusHtml(checks));
+    } catch (err) {
+      sendHtml(res, 500, `<html><body><h1>500 Internal Error</h1><pre>${err.message}</pre></body></html>`);
+    }
     return;
   }
 
