@@ -4,9 +4,12 @@
 #
 
 app = 'claudereminders'
-primary_region = 'gru'
+primary_region = 'ewr'
 
 [build]
+
+[env]
+  TZ = 'America/Sao_Paulo'
 
 [http_service]
   internal_port = 8080
