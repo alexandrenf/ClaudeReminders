@@ -3,7 +3,7 @@
  *
  * Adds a lightweight HTTP server alongside the existing calendar polling logic:
  *   GET  /health  → 200 { status: "ok", uptime: <seconds> }   (no auth, used by Fly.io)
- *   GET  /status  → HTML health page with calendar check       (requires Bearer NOTIFY_TOKEN, for UptimeRobot)
+ *   GET  /status  → JSON poll status report                    (requires Bearer NOTIFY_TOKEN, for UptimeRobot)
  *   POST /notify  → sends a Pushover notification directly     (requires Bearer NOTIFY_TOKEN)
  *
  * Fly.io setup:
@@ -26,8 +26,11 @@ const PORT = parseInt(process.env.PORT ?? "8080", 10);
 const POLL_INTERVAL_MS = 2 * 60 * 1000; // 2 minutes
 const FIRE_WINDOW_MS = 2 * 60 * 1000;   // notify if event starts within 2 min
 const LOOKBACK_BUFFER_MS = 30 * 1000;
-const LATE_EVENT_GRACE_MS = POLL_INTERVAL_MS;
+const OUTBOUND_REQUEST_TIMEOUT_MS = 10 * 1000;
+const MAX_NOTIFICATION_ATTEMPTS = 4;
+const MAX_NOTIFICATION_BACKOFF_MS = 15 * 60 * 1000;
 const FIRED_EVENT_RETENTION_MS = FIRE_WINDOW_MS + POLL_INTERVAL_MS + LOOKBACK_BUFFER_MS;
+const FAILED_EVENT_RETENTION_MS = FIRE_WINDOW_MS + MAX_NOTIFICATION_BACKOFF_MS + LOOKBACK_BUFFER_MS;
 const STALE_POLL_THRESHOLD_MS = 2 * POLL_INTERVAL_MS + LOOKBACK_BUFFER_MS;
 
 // ── Env validation ────────────────────────────────────────────────────────────
@@ -60,9 +63,9 @@ function getCalendarClient() {
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
-const firedEvents = new Map();
+const eventStates = new Map();
 const startedAt = Date.now();
-let lastCheckedAt = startedAt;
+let lastSuccessfulWindowEndAt = startedAt;
 const pollState = {
   isPolling: false,
   lastPollStartedAt: null,
@@ -73,15 +76,48 @@ const pollState = {
   lastEventCount: 0,
   lastNotificationCount: 0,
   lastNotificationFailureCount: 0,
+  lastSuccessfulWindowEndAt,
   lastWindowStartAt: null,
   lastWindowEndAt: null,
+  trackedEventCount: 0,
+  pendingRetryCount: 0,
+  exhaustedEventCount: 0,
+  healthSource: "cached_poll_state",
 };
 
-function pruneFiredEvents(nowMs) {
-  const cutoff = nowMs - FIRED_EVENT_RETENTION_MS;
-  for (const [key, ts] of firedEvents) {
-    if (ts < cutoff) firedEvents.delete(key);
+function createTimeoutError(label, timeoutMs) {
+  const err = new Error(`${label} timed out after ${timeoutMs}ms`);
+  err.name = "TimeoutError";
+  return err;
+}
+
+async function withTimeout(run, timeoutMs, label) {
+  let timer;
+
+  try {
+    return await Promise.race([
+      Promise.resolve().then(run),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(createTimeoutError(label, timeoutMs)), timeoutMs);
+        if (typeof timer.unref === "function") timer.unref();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+function computePollWindow({
+  startedAtMs,
+  lastSuccessfulWindowEndAtMs,
+  pollStartedAtMs,
+  lookbackBufferMs = LOOKBACK_BUFFER_MS,
+  fireWindowMs = FIRE_WINDOW_MS,
+}) {
+  return {
+    windowStartMs: Math.max(startedAtMs, lastSuccessfulWindowEndAtMs - lookbackBufferMs),
+    windowEndMs: pollStartedAtMs + fireWindowMs,
+  };
 }
 
 function getEventStartValue(event) {
@@ -104,21 +140,149 @@ function toIsoOrNull(timestampMs) {
   return timestampMs === null ? null : new Date(timestampMs).toISOString();
 }
 
+function getNotificationTitle(event) {
+  return event.summary || "Reminder";
+}
+
+function getNotificationMessage(event) {
+  return event.description || "";
+}
+
+function createNotificationState({
+  eventKey,
+  eventId,
+  title,
+  message,
+  eventStartMs,
+  observedAtMs,
+}) {
+  return {
+    eventKey,
+    eventId,
+    title,
+    message,
+    eventStartMs,
+    firstObservedAt: observedAtMs,
+    lastObservedAt: observedAtMs,
+    lastAttemptAt: null,
+    nextRetryAt: observedAtMs,
+    attemptCount: 0,
+    status: "pending",
+    lastError: null,
+    notifiedAt: null,
+  };
+}
+
+function upsertNotificationStateFromEvent(event, observedAtMs) {
+  const eventKey = getEventNotificationKey(event);
+  const existing = eventStates.get(eventKey);
+
+  if (existing) {
+    existing.eventId = event.id;
+    existing.title = getNotificationTitle(event);
+    existing.message = getNotificationMessage(event);
+    existing.eventStartMs = getEventStartMs(event);
+    existing.lastObservedAt = observedAtMs;
+    return existing;
+  }
+
+  const state = createNotificationState({
+    eventKey,
+    eventId: event.id,
+    title: getNotificationTitle(event),
+    message: getNotificationMessage(event),
+    eventStartMs: getEventStartMs(event),
+    observedAtMs,
+  });
+  eventStates.set(eventKey, state);
+  return state;
+}
+
+function computeRetryDelayMs(attemptCount) {
+  const exponent = Math.max(0, attemptCount - 1);
+  return Math.min(POLL_INTERVAL_MS * (2 ** exponent), MAX_NOTIFICATION_BACKOFF_MS);
+}
+
+function shouldAttemptNotification(state, nowMs) {
+  if (state.status === "sent" || state.status === "exhausted") return false;
+  if (state.nextRetryAt === null) return false;
+  return state.nextRetryAt <= nowMs;
+}
+
+function recordNotificationSuccess(state, attemptedAtMs) {
+  state.attemptCount += 1;
+  state.lastAttemptAt = attemptedAtMs;
+  state.nextRetryAt = null;
+  state.status = "sent";
+  state.lastError = null;
+  state.notifiedAt = attemptedAtMs;
+}
+
+function recordNotificationFailure(state, attemptedAtMs, errorMessage) {
+  state.attemptCount += 1;
+  state.lastAttemptAt = attemptedAtMs;
+  state.lastError = errorMessage;
+
+  if (state.attemptCount >= MAX_NOTIFICATION_ATTEMPTS) {
+    state.nextRetryAt = null;
+    state.status = "exhausted";
+    return;
+  }
+
+  state.nextRetryAt = attemptedAtMs + computeRetryDelayMs(state.attemptCount);
+  state.status = "failed";
+}
+
+function shouldPruneNotificationState(state, nowMs) {
+  const referenceMs = state.eventStartMs
+    ?? state.notifiedAt
+    ?? state.lastAttemptAt
+    ?? state.lastObservedAt
+    ?? state.firstObservedAt;
+  const retentionMs = state.status === "sent" ? FIRED_EVENT_RETENTION_MS : FAILED_EVENT_RETENTION_MS;
+
+  return referenceMs < nowMs - retentionMs;
+}
+
+function pruneNotificationStates(nowMs) {
+  for (const [eventKey, state] of eventStates) {
+    if (shouldPruneNotificationState(state, nowMs)) eventStates.delete(eventKey);
+  }
+}
+
+function updateNotificationStateMetrics() {
+  let pendingRetryCount = 0;
+  let exhaustedEventCount = 0;
+
+  for (const state of eventStates.values()) {
+    if (state.status === "failed" || state.status === "pending") pendingRetryCount += 1;
+    if (state.status === "exhausted") exhaustedEventCount += 1;
+  }
+
+  pollState.trackedEventCount = eventStates.size;
+  pollState.pendingRetryCount = pendingRetryCount;
+  pollState.exhaustedEventCount = exhaustedEventCount;
+}
+
 async function listCalendarEvents(calendar, timeMin, timeMax) {
   const items = [];
   let pageToken;
 
   do {
-    const res = await calendar.events.list({
-      calendarId: CALENDAR_ID,
-      timeMin,
-      timeMax,
-      singleEvents: true,
-      orderBy: "startTime",
-      maxResults: 250,
-      pageToken,
-      fields: "items(id,summary,description,start,originalStartTime),nextPageToken",
-    });
+    const res = await withTimeout(
+      () => calendar.events.list({
+        calendarId: CALENDAR_ID,
+        timeMin,
+        timeMax,
+        singleEvents: true,
+        orderBy: "startTime",
+        maxResults: 250,
+        pageToken,
+        fields: "items(id,summary,description,start,originalStartTime),nextPageToken",
+      }, { timeout: OUTBOUND_REQUEST_TIMEOUT_MS }),
+      OUTBOUND_REQUEST_TIMEOUT_MS + 1000,
+      "Google Calendar request",
+    );
 
     items.push(...(res.data.items || []));
     pageToken = res.data.nextPageToken;
@@ -129,18 +293,35 @@ async function listCalendarEvents(calendar, timeMin, timeMax) {
 
 // ── Pushover ──────────────────────────────────────────────────────────────────
 async function sendPushover(title, message) {
-  const res = await fetch("https://api.pushover.net/1/messages.json", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      token: PUSHOVER_TOKEN,
-      user: PUSHOVER_USER,
-      title: `🔔 ${title}`,
-      message: message || "No description.",
-      sound: "magic",
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), OUTBOUND_REQUEST_TIMEOUT_MS);
+  if (typeof timeoutId.unref === "function") timeoutId.unref();
+
+  let res;
+  try {
+    res = await fetch("https://api.pushover.net/1/messages.json", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        token: PUSHOVER_TOKEN,
+        user: PUSHOVER_USER,
+        title: `🔔 ${title}`,
+        message: message || "No description.",
+        sound: "magic",
+      }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err.name === "AbortError") throw createTimeoutError("Pushover request", OUTBOUND_REQUEST_TIMEOUT_MS);
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
   const data = await res.json();
+  if (!res.ok) {
+    throw new Error(`Pushover request failed with HTTP ${res.status}: ${JSON.stringify(data)}`);
+  }
   if (data.status !== 1) {
     console.error("Pushover error:", data);
     throw new Error(`Pushover rejected: ${JSON.stringify(data)}`);
@@ -151,10 +332,15 @@ async function sendPushover(title, message) {
 // ── Calendar polling ──────────────────────────────────────────────────────────
 async function poll() {
   const pollStartedAt = Date.now();
-  const windowStartMs = Math.max(startedAt, lastCheckedAt - LOOKBACK_BUFFER_MS);
-  const windowEndMs = pollStartedAt + FIRE_WINDOW_MS;
+  const { windowStartMs, windowEndMs } = computePollWindow({
+    startedAtMs: startedAt,
+    lastSuccessfulWindowEndAtMs: lastSuccessfulWindowEndAt,
+    pollStartedAtMs: pollStartedAt,
+  });
   let notificationCount = 0;
   let notificationFailureCount = 0;
+  let events = [];
+  let calendarError = null;
 
   pollState.isPolling = true;
   pollState.lastPollStartedAt = pollStartedAt;
@@ -163,62 +349,82 @@ async function poll() {
   pollState.lastPollError = null;
 
   try {
-    const calendar = getCalendarClient();
-    const events = await listCalendarEvents(
-      calendar,
-      new Date(windowStartMs).toISOString(),
-      new Date(windowEndMs).toISOString(),
-    );
-
-    for (const event of events) {
-      const eventStartMs = getEventStartMs(event);
-      if (eventStartMs !== null && eventStartMs < pollStartedAt - LATE_EVENT_GRACE_MS) continue;
-
-      const eventKey = getEventNotificationKey(event);
-      if (firedEvents.has(eventKey)) continue;
-
-      firedEvents.set(eventKey, pollStartedAt);
-
-      try {
-        await sendPushover(event.summary || "Reminder", event.description || "");
-        notificationCount += 1;
-      } catch (err) {
-        firedEvents.delete(eventKey);
-        notificationFailureCount += 1;
-        console.error(`[${new Date().toISOString()}] Notification error for event ${event.id}:`, err.message);
-      }
+    try {
+      const calendar = getCalendarClient();
+      events = await listCalendarEvents(
+        calendar,
+        new Date(windowStartMs).toISOString(),
+        new Date(windowEndMs).toISOString(),
+      );
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Poll error:`, err.message);
+      calendarError = err;
     }
 
-    lastCheckedAt = pollStartedAt;
-    pruneFiredEvents(pollStartedAt);
-    pollState.lastPollCompletedAt = Date.now();
-    pollState.lastSuccessfulPollAt = pollState.lastPollCompletedAt;
-    pollState.lastPollStatus = notificationFailureCount > 0 ? "degraded" : "ok";
-    pollState.lastPollError = notificationFailureCount > 0
-      ? `${notificationFailureCount} notification(s) failed during the last poll`
-      : null;
+    for (const event of events) {
+      upsertNotificationStateFromEvent(event, pollStartedAt);
+    }
+
+    const dueStates = Array
+      .from(eventStates.values())
+      .filter((state) => shouldAttemptNotification(state, pollStartedAt))
+      .sort((left, right) => {
+        const leftOrder = left.eventStartMs ?? left.firstObservedAt;
+        const rightOrder = right.eventStartMs ?? right.firstObservedAt;
+        return leftOrder - rightOrder;
+      });
+
+    for (const state of dueStates) {
+      const attemptedAtMs = Date.now();
+
+      try {
+        await sendPushover(state.title, state.message);
+        recordNotificationSuccess(state, attemptedAtMs);
+        notificationCount += 1;
+      } catch (err) {
+        recordNotificationFailure(state, attemptedAtMs, err.message);
+        notificationFailureCount += 1;
+        console.error(`[${new Date().toISOString()}] Notification error for event ${state.eventId}:`, err.message);
+      }
+    }
+  } finally {
+    const completedAt = Date.now();
+
+    pruneNotificationStates(completedAt);
+    updateNotificationStateMetrics();
+
+    if (calendarError === null) {
+      lastSuccessfulWindowEndAt = windowEndMs;
+      pollState.lastSuccessfulPollAt = completedAt;
+      pollState.lastSuccessfulWindowEndAt = lastSuccessfulWindowEndAt;
+    }
+
+    pollState.lastPollCompletedAt = completedAt;
+    pollState.lastPollStatus = calendarError
+      ? "down"
+      : (notificationFailureCount > 0 ? "degraded" : "ok");
+    pollState.lastPollError = calendarError
+      ? calendarError.message
+      : (notificationFailureCount > 0
+        ? `${notificationFailureCount} notification(s) failed during the last poll`
+        : null);
     pollState.lastEventCount = events.length;
     pollState.lastNotificationCount = notificationCount;
     pollState.lastNotificationFailureCount = notificationFailureCount;
-  } catch (err) {
-    console.error(`[${new Date().toISOString()}] Poll error:`, err.message);
-    pruneFiredEvents(pollStartedAt);
-    pollState.lastPollCompletedAt = Date.now();
-    pollState.lastPollStatus = "down";
-    pollState.lastPollError = err.message;
-    pollState.lastEventCount = 0;
-    pollState.lastNotificationCount = notificationCount;
-    pollState.lastNotificationFailureCount = notificationFailureCount;
-  } finally {
     pollState.isPolling = false;
   }
 }
 
 async function runPollLoop() {
   const cycleStartedAt = Date.now();
-  await poll();
-  const delayMs = Math.max(0, POLL_INTERVAL_MS - (Date.now() - cycleStartedAt));
-  setTimeout(runPollLoop, delayMs);
+  try {
+    await poll();
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Unhandled poll loop error:`, err);
+  } finally {
+    const delayMs = Math.max(0, POLL_INTERVAL_MS - (Date.now() - cycleStartedAt));
+    setTimeout(runPollLoop, delayMs);
+  }
 }
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
@@ -241,26 +447,44 @@ function send(res, status, body) {
 }
 
 // ── Health checks ─────────────────────────────────────────────────────────────
+function getOverallStatus(
+  nowMs,
+  {
+    startedAtMs = startedAt,
+    pollState: currentPollState = pollState,
+    stalePollThresholdMs = STALE_POLL_THRESHOLD_MS,
+  } = {},
+) {
+  const lastSuccessAgeMs = currentPollState.lastSuccessfulPollAt === null
+    ? null
+    : nowMs - currentPollState.lastSuccessfulPollAt;
+  const currentPollAgeMs = currentPollState.isPolling && currentPollState.lastPollStartedAt !== null
+    ? nowMs - currentPollState.lastPollStartedAt
+    : null;
+
+  if (currentPollState.lastSuccessfulPollAt === null) {
+    return nowMs - startedAtMs <= stalePollThresholdMs ? "starting" : "down";
+  }
+
+  if (lastSuccessAgeMs > stalePollThresholdMs) {
+    return currentPollState.isPolling && currentPollAgeMs !== null && currentPollAgeMs <= stalePollThresholdMs
+      ? "degraded"
+      : "down";
+  }
+
+  if (currentPollState.lastPollStatus === "down" || currentPollState.lastPollStatus === "degraded") {
+    return "degraded";
+  }
+
+  return "ok";
+}
+
 async function runHealthChecks() {
   const nowMs = Date.now();
   const lastSuccessAgeMs = pollState.lastSuccessfulPollAt === null
     ? null
     : nowMs - pollState.lastSuccessfulPollAt;
-  const currentPollAgeMs = pollState.isPolling && pollState.lastPollStartedAt !== null
-    ? nowMs - pollState.lastPollStartedAt
-    : null;
-
-  let status = "ok";
-
-  if (pollState.lastSuccessfulPollAt === null) {
-    status = pollState.isPolling ? "starting" : "down";
-  } else if (lastSuccessAgeMs > STALE_POLL_THRESHOLD_MS) {
-    status = pollState.isPolling && currentPollAgeMs !== null && currentPollAgeMs <= STALE_POLL_THRESHOLD_MS
-      ? "degraded"
-      : "down";
-  } else if (pollState.lastPollStatus === "down" || pollState.lastPollStatus === "degraded") {
-    status = "degraded";
-  }
+  const status = getOverallStatus(nowMs);
 
   const report = {
     status,
@@ -268,10 +492,12 @@ async function runHealthChecks() {
     uptime: Math.floor((nowMs - startedAt) / 1000),
     calendar: {
       status,
+      observedVia: pollState.healthSource,
       isPolling: pollState.isPolling,
       lastPollStartedAt: toIsoOrNull(pollState.lastPollStartedAt),
       lastPollCompletedAt: toIsoOrNull(pollState.lastPollCompletedAt),
       lastSuccessfulPollAt: toIsoOrNull(pollState.lastSuccessfulPollAt),
+      lastSuccessfulWindowEndAt: toIsoOrNull(pollState.lastSuccessfulWindowEndAt),
       secondsSinceLastSuccessfulPoll: lastSuccessAgeMs === null ? null : Math.floor(lastSuccessAgeMs / 1000),
       staleAfterSeconds: Math.floor(STALE_POLL_THRESHOLD_MS / 1000),
       lastPollStatus: pollState.lastPollStatus,
@@ -281,6 +507,9 @@ async function runHealthChecks() {
       lastNotificationFailureCount: pollState.lastNotificationFailureCount,
       lastWindowStartAt: toIsoOrNull(pollState.lastWindowStartAt),
       lastWindowEndAt: toIsoOrNull(pollState.lastWindowEndAt),
+      trackedEventCount: pollState.trackedEventCount,
+      pendingRetryCount: pollState.pendingRetryCount,
+      exhaustedEventCount: pollState.exhaustedEventCount,
     },
   };
 
@@ -341,11 +570,35 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-validateEnv();
+function start() {
+  validateEnv();
 
-httpServer.listen(PORT, () => {
-  console.log(`[${new Date().toISOString()}] HTTP server listening on port ${PORT}`);
-});
+  httpServer.listen(PORT, () => {
+    console.log(`[${new Date().toISOString()}] HTTP server listening on port ${PORT}`);
+  });
 
-console.log(`[${new Date().toISOString()}] Worker started. Polling every ${POLL_INTERVAL_MS / 1000}s`);
-runPollLoop();
+  console.log(`[${new Date().toISOString()}] Worker started. Polling every ${POLL_INTERVAL_MS / 1000}s`);
+  runPollLoop();
+}
+
+if (require.main === module) {
+  start();
+}
+
+module.exports = {
+  computePollWindow,
+  computeRetryDelayMs,
+  createNotificationState,
+  shouldAttemptNotification,
+  recordNotificationFailure,
+  recordNotificationSuccess,
+  shouldPruneNotificationState,
+  getOverallStatus,
+  constants: {
+    FIRE_WINDOW_MS,
+    LOOKBACK_BUFFER_MS,
+    POLL_INTERVAL_MS,
+    MAX_NOTIFICATION_ATTEMPTS,
+    STALE_POLL_THRESHOLD_MS,
+  },
+};

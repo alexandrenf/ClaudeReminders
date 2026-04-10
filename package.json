@@ -4,7 +4,8 @@
   "description": "Polls Google Calendar and sends Pushover notifications",
   "main": "reminder.js",
   "scripts": {
-    "start": "node reminder.js"
+    "start": "node reminder.js",
+    "test": "node --test"
   },
   "dependencies": {
     "googleapis": "^144.0.0"
