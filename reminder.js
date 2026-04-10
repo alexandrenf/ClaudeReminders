@@ -16,7 +16,6 @@
 
 const http = require("http");
 const { google } = require("googleapis");
-const fetch = require("node-fetch");
 
 // ── Config from env vars ──────────────────────────────────────────────────────
 const CALENDAR_ID = process.env.CALENDAR_ID;
@@ -43,19 +42,30 @@ function validateEnv() {
   }
 }
 
-// ── Google Auth ───────────────────────────────────────────────────────────────
+// ── Google Auth (singleton) ────────────────────────────────────────────────────
+let _calendar;
 function getCalendarClient() {
+  if (_calendar) return _calendar;
   const keyJson = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
   const auth = new google.auth.GoogleAuth({
     credentials: keyJson,
     scopes: ["https://www.googleapis.com/auth/calendar.readonly"],
   });
-  return google.calendar({ version: "v3", auth });
+  _calendar = google.calendar({ version: "v3", auth });
+  return _calendar;
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
-const firedEvents = new Set();
+const firedEvents = new Map();
 const startedAt = Date.now();
+
+function pruneFiredEvents() {
+  if (firedEvents.size <= 500) return;
+  const cutoff = Date.now() - POLL_INTERVAL_MS;
+  for (const [id, ts] of firedEvents) {
+    if (ts < cutoff) firedEvents.delete(id);
+  }
+}
 
 // ── Pushover ──────────────────────────────────────────────────────────────────
 async function sendPushover(title, message) {
@@ -96,11 +106,11 @@ async function poll() {
     const events = res.data.items || [];
     for (const event of events) {
       if (firedEvents.has(event.id)) continue;
-      firedEvents.add(event.id);
+      firedEvents.set(event.id, Date.now());
       await sendPushover(event.summary || "Reminder", event.description || "");
     }
 
-    if (firedEvents.size > 500) firedEvents.clear();
+    pruneFiredEvents();
   } catch (err) {
     console.error(`[${new Date().toISOString()}] Poll error:`, err.message);
   }
@@ -164,6 +174,7 @@ function isAuthorized(req, query) {
 }
 
 const httpServer = http.createServer(async (req, res) => {
+  req.setTimeout(10000);
   const { pathname, searchParams } = new URL(req.url, "http://localhost");
 
   // GET /health — no auth required (used by Fly.io)
